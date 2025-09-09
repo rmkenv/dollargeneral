@@ -1,0 +1,6 @@
+geopandas
+keplergl
+requests
+shapely
+pyproj
+pandas
