@@ -1,134 +1,124 @@
-# === Install Required Packages ===
-# Run this manually before running the script, e.g.:
-# pip install geopandas keplergl requests shapely pyproj pandas
+# === Install Required Packages (run once) ===
+# !pip install geopandas keplergl requests shapely pyproj
 
+# === Imports ===
 import geopandas as gpd
 import requests
 import pandas as pd
 from keplergl import KeplerGl
+from pathlib import Path
 
-# For file dialogs (used here for local file selection, adjust if running outside Jupyter)
-import tkinter as tk
-from tkinter import filedialog
-import os
+# === Config ===
+GEOPACKAGE_PATH = "path/to/your_geopackage.gpkg"  # <-- update
+OUTPUT_DIR = "output"
+Path(OUTPUT_DIR).mkdir(exist_ok=True)
 
-def select_file():
-    root = tk.Tk()
-    root.withdraw()
-    file_path = filedialog.askopenfilename(title="Select Dollar General GeoPackage file", 
-                                           filetypes=[("GeoPackage Files", "*.gpkg")])
-    return file_path
-
-def main():
-    # === Upload / Select your GeoPackage file ===
-    gpkg_filename = select_file()
-    if not gpkg_filename:
-        print("No file selected, exiting.")
-        return
-    
-    print(f"Selected GeoPackage file: {gpkg_filename}")
-
-    # === Load GeoPackage (Dollar General stores) ===
-    gdf_stores = gpd.read_file(gpkg_filename)
-
-    # === Download ACS Median Income Boundaries from ArcGIS REST API ===
-    arcgis_url = 'https://services.arcgis.com/P3ePLMYs2RVChkJx/arcgis/rest/services/ACS_Median_Income_by_Race_and_Age_Selp_Emp_Boundaries/FeatureServer/0/query'
-    params = {
-        'where': '1=1',
-        'outFields': '*',
-        'f': 'geojson',
-        'returnGeometry': 'true'
-    }
-
-    # Add error handling for API request
-    try:
-        response = requests.get(arcgis_url, params=params)
-        response.raise_for_status()  # Raises HTTPError for bad responses
-        income_geojson = response.json()
-        print(f"Successfully downloaded {len(income_geojson['features'])} features")
-    except requests.exceptions.RequestException as e:
-        print(f"Error downloading data: {e}")
-        return
-
-    # === Convert JSON Response to GeoDataFrame ===
-    gdf_income = gpd.GeoDataFrame.from_features(income_geojson['features'])
-    gdf_income.set_crs(epsg=4326, inplace=True)
-
-    # === Ensure CRS Consistency and Project to a Conformal Projection for Buffering ===
-    if gdf_stores.crs is None:
-        gdf_stores.set_crs(epsg=4326, inplace=True)
-        print("Set CRS for stores to EPSG:4326")
-
-    if gdf_stores.crs != gdf_income.crs:
-        gdf_stores = gdf_stores.to_crs(gdf_income.crs)
-        print(f"Reprojected stores to {gdf_income.crs}")
-
-    # Project both to EPSG:3857 (Web Mercator) for accurate buffering in meters
-    gdf_stores_proj = gdf_stores.to_crs(epsg=3857)
-    gdf_income_proj = gdf_income.to_crs(epsg=3857)
-
-    # === Buffer Stores by 3 miles (1 mile = 1609.34 meters) ===
-    buffer_distance = 3 * 1609.34  # 3 miles in meters
-    gdf_stores_proj['buffer_3mi'] = gdf_stores_proj.geometry.buffer(buffer_distance)
-
-    # Make a GeoDataFrame of buffers
-    gdf_buffers = gpd.GeoDataFrame(gdf_stores_proj.drop(columns='geometry'), geometry='buffer_3mi', crs=gdf_stores_proj.crs)
-
-    # === Spatial Join: Find ACS Tracts intersecting each buffer ===
-    joined = gpd.sjoin(gdf_income_proj, gdf_buffers, how='inner', predicate='intersects')
-
-    # === Calculate Average Median Income for each buffer polygon ===
-    income_fields = [col for col in joined.columns if 'income' in col.lower() or 'B19' in col]
-    print(f"Available income fields: {income_fields}")
-
-    income_field = None
-    possible_fields = ['B19053_001M', 'B19053_001E', 'MedianIncome', 'MEDIAN_INCOME', 'MedInc']
-    for field in possible_fields:
-        if field in joined.columns:
-            income_field = field
+# === Download Helper (paging ArcGIS) ===
+def fetch_all_features(url, base_params, page_size=2000, timeout=60):
+    params = base_params.copy()
+    params['resultRecordCount'] = page_size
+    params['resultOffset'] = 0
+    features = []
+    while True:
+        resp = requests.get(url, params=params, timeout=timeout)
+        resp.raise_for_status()
+        data = resp.json()
+        feats = data.get('features', [])
+        features.extend(feats)
+        if len(feats) < page_size:
             break
+        params['resultOffset'] += page_size
+    return {'type': 'FeatureCollection', 'features': features}
 
-    if income_field is None:
-        numeric_cols = joined.select_dtypes(include=['number']).columns
-        income_field = numeric_cols[0] if len(numeric_cols) > 0 else 'B19053_001M'
-        print(f"Using field: {income_field}")
+# === Load stores ===
+gdf_stores = gpd.read_file(GEOPACKAGE_PATH)
+if gdf_stores.crs is None:
+    gdf_stores.set_crs(epsg=4326, inplace=True)
+print(f"Loaded {len(gdf_stores)} stores")
 
-    avg_income = joined.groupby('index_right')[income_field].agg(['mean', 'count']).reset_index()
-    avg_income.columns = ['index_right', 'avg_median_income_3mi', 'tract_count']
-    avg_income = avg_income[avg_income['tract_count'] > 0]
+# === Get income polygons ===
+arcgis_url = "https://services.arcgis.com/P3ePLMYs2RVChkJx/arcgis/rest/services/ACS_Median_Income_by_Race_and_Age_Selp_Emp_Boundaries/FeatureServer/0/query"
+params = {
+    "where": "1=1",
+    "outFields": "B19053_001M,B19053_001E,GEOID,NAME",
+    "f": "geojson",
+    "returnGeometry": "true"
+}
+income_geojson = fetch_all_features(arcgis_url, params, page_size=2000)
+gdf_income = gpd.GeoDataFrame.from_features(income_geojson['features']).set_crs(epsg=4326)
+print(f"Downloaded {len(gdf_income)} income polygons")
 
-    gdf_buffers = gdf_buffers.merge(avg_income, left_index=True, right_on='index_right', how='left')
+# === Project to Albers Equal Area (better for distance) ===
+gdf_stores_proj = gdf_stores.to_crs(epsg=5070)
+gdf_income_proj = gdf_income.to_crs(epsg=5070)
 
-    # === Filter buffers for high median income (threshold $100,000) ===
-    gdf_buffers['avg_median_income_3mi'] = gdf_buffers['avg_median_income_3mi'].fillna(0)
-    high_income_buffers = gdf_buffers[gdf_buffers['avg_median_income_3mi'] >= 100000]
-    print(f"Found {len(high_income_buffers)} high-income buffer areas out of {len(gdf_buffers)} total")
+# === Create 10‑mile buffers ===
+buffer_dist_m = 10 * 1609.34  # 10 miles in meters
+gdf_stores_proj['buffer_10mi'] = gdf_stores_proj.geometry.buffer(buffer_dist_m)
+gdf_buffers = gpd.GeoDataFrame(
+    gdf_stores_proj.drop(columns='geometry'),
+    geometry='buffer_10mi',
+    crs=gdf_stores_proj.crs
+)
 
-    high_income_buffers = gpd.GeoDataFrame(high_income_buffers, geometry='buffer_3mi', crs=gdf_buffers.crs)
+# === Spatial Join: income polygons intersecting buffers ===
+print("Performing spatial join...")
+joined = gpd.sjoin(gdf_income_proj, gdf_buffers, how='inner', predicate='intersects')
+print(f"Created {len(joined)} tract-buffer matches")
 
-    # === Reproject back to WGS84 for visualization ===
-    high_income_buffers_wgs84 = high_income_buffers.to_crs(epsg=4326)
-    gdf_stores_wgs84 = gdf_stores_proj.to_crs(epsg=4326)
+# === Aggregate income per buffer (by buffer index) ===
+income_field = 'B19053_001M' if 'B19053_001M' in joined.columns else None
+if income_field is None:
+    numeric_cols = joined.select_dtypes(include=['number']).columns
+    income_field = numeric_cols[0]
+    print(f"Fallback using field: {income_field}")
 
-    # === Create Kepler.gl Dashboard ===
-    map_1 = KeplerGl(height=600)
+agg = joined.groupby('index_right')[income_field].agg(['mean', 'count']).rename(
+    columns={'mean': 'avg_median_income_10mi', 'count': 'tract_count'}
+)
 
-    if len(high_income_buffers_wgs84) > 0:
-        map_1.add_data(data=high_income_buffers_wgs84, name="High Income Areas (3 mi)")
-        print(f"Added {len(high_income_buffers_wgs84)} high-income buffer areas to map")
-    else:
-        print("No high-income areas found to display")
+# === Merge back onto buffers with GeoPandas .join (preserves geometry) ===
+gdf_buffers = gdf_buffers.join(agg, how='left')
+gdf_buffers['avg_median_income_10mi'] = gdf_buffers['avg_median_income_10mi'].fillna(0).round(2)
+gdf_buffers['tract_count'] = gdf_buffers['tract_count'].fillna(0).astype(int)
 
-    map_1.add_data(data=gdf_stores_wgs84, name="Dollar Stores")
-    print(f"Added {len(gdf_stores_wgs84)} store locations to map")
+# === Reproject to WGS84 for web viz ===
+gdf_stores_wgs84  = gdf_stores_proj.to_crs(epsg=4326)
+gdf_buffers_wgs84 = gdf_buffers.to_crs(epsg=4326)
+gdf_income_wgs84  = gdf_income_proj.to_crs(epsg=4326)
 
-    # === Save Dashboard ===
-    dashboard_html = "kepler_dashboard.html"
-    try:
-        map_1.save_to_html(file_name=dashboard_html)
-        print(f"Dashboard saved as {dashboard_html}")
-    except Exception as e:
-        print(f"Error saving dashboard: {e}")
+print(f"Buffer columns: {list(gdf_buffers_wgs84.columns)}")
+print(f"Active geometry: {gdf_buffers_wgs84.geometry.name}")
 
-if __name__ == "__main__":
-    main()
+# Optional: simplify for performance
+gdf_buffers_wgs84.geometry = gdf_buffers_wgs84.geometry.simplify(0.002)
+gdf_income_wgs84.geometry  = gdf_income_wgs84.geometry.simplify(0.001)
+
+# === Clean up multiple geometry columns before saving ===
+# Check for multiple geometry columns and keep only the active one
+geom_cols = [col for col in gdf_buffers_wgs84.columns if gdf_buffers_wgs84[col].dtype == 'geometry']
+if len(geom_cols) > 1:
+    # Keep only the active geometry column
+    active_geom = gdf_buffers_wgs84.geometry.name
+    cols_to_drop = [col for col in geom_cols if col != active_geom]
+    gdf_buffers_wgs84 = gdf_buffers_wgs84.drop(columns=cols_to_drop)
+    print(f"Dropped extra geometry columns: {cols_to_drop}")
+
+# === Save outputs ===
+gdf_buffers_wgs84.to_file(f"{OUTPUT_DIR}/store_buffers_income_10mi.geojson", driver="GeoJSON")
+print("Saved buffers with income stats")
+
+# === Kepler.gl viz: three layers ===
+map_1 = KeplerGl(height=700)
+map_1.add_data(data=gdf_income_wgs84, name="Income Polygons")
+map_1.add_data(data=gdf_buffers_wgs84, name="Store Buffers (10 mi) w/ Income Avg + Count")
+map_1.add_data(data=gdf_stores_wgs84, name="Store Points")
+
+dashboard_html = f"{OUTPUT_DIR}/kepler_spatial_join_10mi.html"
+try:
+    map_1.save_to_html(file_name=dashboard_html)
+    print(f"Dashboard saved to {dashboard_html}")
+except Exception as e:
+    print(f"Error saving dashboard: {e}")
+
+map_1
